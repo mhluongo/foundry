@@ -71,6 +71,102 @@ mod tasks;
 #[cfg(feature = "cmd")]
 pub mod cmd;
 
+/// Creates the node for in-memory use
+///
+/// Returns the [EthApi] that can be used to interact with the node and the [JoinHandle] of the
+/// task.
+///
+/// # Example
+///
+/// ```rust
+/// # use anvil::NodeConfig;
+/// # async fn spawn() {
+/// let config = NodeConfig::default();
+/// let api = anvil::spawn_in_memory(config).await;
+///
+/// // use api
+///
+/// # }
+/// ```
+pub async fn spawn_in_memory(mut config: NodeConfig) -> EthApi {
+    let logger = if config.enable_tracing { init_tracing() } else { Default::default() };
+
+    let backend = Arc::new(config.setup().await);
+
+    let fork = backend.get_fork().cloned();
+
+    let NodeConfig {
+        signer_accounts,
+        block_time,
+        port,
+        max_transactions,
+        server_config,
+        no_mining,
+        transaction_order,
+        genesis,
+        ..
+    } = config.clone();
+
+    let pool = Arc::new(Pool::default());
+
+    let mode = if let Some(block_time) = block_time {
+        MiningMode::interval(block_time)
+    } else if no_mining {
+        MiningMode::None
+    } else {
+        // get a listener for ready transactions
+        let listener = pool.add_ready_listener();
+        MiningMode::instant(max_transactions, listener)
+    };
+    let miner = Miner::new(mode);
+
+    let dev_signer: Box<dyn EthSigner> = Box::new(DevSigner::new(signer_accounts));
+    let mut signers = vec![dev_signer];
+    if let Some(genesis) = genesis {
+        // include all signers from genesis.json if any
+        let genesis_signers = genesis.private_keys();
+        if !genesis_signers.is_empty() {
+            let genesis_signers: Box<dyn EthSigner> = Box::new(DevSigner::new(genesis_signers));
+            signers.push(genesis_signers);
+        }
+    }
+
+    let fees = backend.fees().clone();
+    let fee_history_cache = Arc::new(Mutex::new(Default::default()));
+    let fee_history_service = FeeHistoryService::new(
+        backend.new_block_notifications(),
+        Arc::clone(&fee_history_cache),
+        fees,
+        StorageInfo::new(Arc::clone(&backend)),
+    );
+
+    let filters = Filters::default();
+
+    // create the cloneable api wrapper
+    let api = EthApi::new(
+        Arc::clone(&pool),
+        Arc::clone(&backend),
+        Arc::new(signers),
+        fee_history_cache,
+        fee_history_service.fee_history_limit(),
+        miner.clone(),
+        logger,
+        filters.clone(),
+        transaction_order,
+    );
+
+    // spawn the node service
+    tokio::task::spawn(NodeService::new(pool, backend, miner, fee_history_service, filters));
+
+    let tokio_handle = Handle::current();
+    let (signal, on_shutdown) = shutdown::signal();
+    let task_manager = TaskManager::new(tokio_handle, on_shutdown);
+
+    config.get_ipc_path().map(|path| spawn_ipc(api.clone(), path));
+
+    api
+}
+
 /// Creates the node and runs the server
 ///
 /// Returns the [EthApi] that can be used to interact with the node and the [JoinHandle] of the
